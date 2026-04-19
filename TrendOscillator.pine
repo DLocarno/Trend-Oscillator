@@ -1,0 +1,240 @@
+//@version=5
+//
+//╔════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╗
+//║ Original Author: Trend Indicator B by DZIV (dzi_v_) // Slope & Exhaustion extension by Dave
+//║ Licence | CC BY-NC-SA 4.0 : https://creativecommons.org/licenses/by-nc-sa/4.0/
+//╠════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╣
+//║ Changelog :
+//║ 2021.04.15 > B-V1.0 -First publish
+//║ 2021.05.05 > B-V2.0 -Added high and low calculation and display
+//║ 					-Minor script optimisation
+//║ 2021.05.06 > B-V2.1 -Added resolution customisation in the study
+//║ 2021.10.18 > B-V2.2 -Added "MA Type" customisation possibility
+//║ 					-Replaced the "colour schemes" feature by a "base color inputs" feature (user friendly)
+//║ 					-Switched the title names to English for a better understanding
+//║ 					-Minor script optimisation
+//║ 2024.04.21 > B-V2.3 -Switched to PineScript version 5
+//║ 					-Major script rethinking and optimisation
+//║ 					-Removed double smoothing for less lag
+//║ 					-Added ALMA, HMA and ZLEMA to the "MA Type" input string
+//║ 					-Added highlights to indicate potential trend reversals
+//║ 2025.04.18 > B-V2.4 -Added Slope / Rate-of-Change model
+//║ 2025.04.18 > B-V2.5 -Added 3-state slope: Rising / Flat / Falling with adjustable nuetral deadband zone
+//║ 2025.04.18 > B-V2.6 -Peak tracking state machine: stores slope peak + close price per cycle
+//║ 2025.04.18 > B-V2.7 -Fixed: cross-invalidation + trend-direction guard on labels
+//║ 2025.04.18 > B-V2.8 -Fixed: momentum threshold now only gates P1, not P2
+//║ 2025.04.18 > B-V2.9 -Fixed: cycle reset now triggered by trend crossing zero, not slope
+//║ 2025.04.18 > B-V3.0 -Fixed: P1 now only advances when the next peak is also strong
+//║ 					 Previously, rolling P1 to a weak P2 orphaned future detections from
+//║ 					 any valid phase — producing labels with no threshold-qualifying event
+//║ 					 behind them. Weak P2s fire a label but keep P1 anchored to the last
+//║ 					 strong peak. P1 only moves forward on strong peak → strong peak.
+//╚════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╝
+//
+//╔════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╗
+//║ Settings :
+indicator('Trend Indicator B (v3.0) [DZIV] With Rate-of-Change', 'Trend Oscillator', false, max_labels_count = 500, max_lines_count = 500)
+
+ma_type   = input.string('VWMA', 'MA Type', ['ALMA','HMA','SMA','SWMA','VWMA','WMA','ZLEMA','EMA'], group = 'Setup')
+ma_period = input.int(30, 'MA Period (Length)', 1, group = 'Setup')
+
+alma_offset = input.float(0.85, 'ALMA Shift',    0, 1, 0.05, group = 'Setup (ALMA)')
+alma_sigma  = input.int(6,     'ALMA Deviation', 1, step = 1, group = 'Setup (ALMA)')
+
+// ── Slope settings ────────────────────────────────────────────────────────────
+slope_method   = input.string('Momentum', 'Slope Method',
+     ['Smoothed Derivative', 'Linear Regression', 'Momentum'],
+     tooltip = 'Smoothed Derivative: MA of bar-by-bar changes.\nLinear Regression: least-squares slope over the window.\nMomentum: raw n-bar difference per bar.',
+     group = 'Slope Settings')
+slope_period   = input.int(5,     'Slope Period',            minval = 2,    group = 'Slope Settings')
+slope_scale    = input.float(7.5, 'Slope Scale',            minval = 0.01, step = 0.1,
+     tooltip = 'Multiply the slope value — use >1 to magnify, <1 to compress.',
+     group = 'Slope Settings')
+slope_deadband = input.float(0.25,  'Deadband (Flat Zone ±)', minval = 0.0,  step = 0.25,
+     tooltip = 'Slope values within ±this threshold are treated as Flat/Plateauing.',
+     group = 'Slope Settings')
+
+// ── Exhaustion labels ─────────────────────────────────────────────────────────
+show_div_lines     = input.bool(true,  'Show divergence lines',   group = 'Exhaustion Labels')
+momentum_threshold = input.float(20.0, 'Momentum Threshold',     minval = 0.1, step = 0.5,
+     tooltip = 'A phase is only established when a slope peak exceeds this magnitude.\n' +
+               'P1 is set on the first strong peak, and only advances to a later strong peak.\n' +
+               'Weak P2s (below threshold) can trigger a label but never become the new P1.\n' +
+               'The cycle resets when the trend line crosses zero.',
+     group = 'Exhaustion Labels')
+
+// ── On/Off ────────────────────────────────────────────────────────────────────
+show_line(x)      => input.bool(true, 'Show trend line',          group = 'On/Off') ? x : na
+show_fill(x)      => input.bool(true, 'Show fill',                group = 'On/Off') ? x : na
+show_highlight(x) => input.bool(true, 'Show highlight',           group = 'On/Off') ? x : na
+show_slope(x)     => input.bool(true, 'Show slope line',          group = 'On/Off') ? x : na
+show_deadband(x)  => input.bool(true, 'Show deadband zone',       group = 'On/Off') ? x : na
+show_markers(x)   => input.bool(true, 'Show slope state markers', group = 'On/Off') ? x : na
+//╠════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╣
+//║ Calculations :
+f(x) =>
+    switch ma_type
+        'ALMA'  => ta.alma(x, ma_period, alma_offset, alma_sigma)
+        'HMA'   => ta.hma(x, ma_period)
+        'SMA'   => ta.sma(x, ma_period)
+        'SWMA'  => ta.swma(x)
+        'VWMA'  => ta.vwma(x, ma_period)
+        'WMA'   => ta.wma(x, ma_period)
+        'ZLEMA' => ta.ema(x + x - x[math.floor((ma_period - 1) / 2)], ma_period)
+        =>         ta.ema(x, ma_period)
+
+ma_heikinashi_open  = f(request.security(ticker.heikinashi(syminfo.tickerid), timeframe.period, open))
+ma_heikinashi_close = f(request.security(ticker.heikinashi(syminfo.tickerid), timeframe.period, close))
+ma_heikinashi_high  = f(request.security(ticker.heikinashi(syminfo.tickerid), timeframe.period, high))
+ma_heikinashi_low   = f(request.security(ticker.heikinashi(syminfo.tickerid), timeframe.period, low))
+
+trend = 100 * (ma_heikinashi_close - ma_heikinashi_open) / (ma_heikinashi_high - ma_heikinashi_low)
+
+// ── Slope / Rate-of-Change ────────────────────────────────────────────────────
+raw_slope = switch slope_method
+    'Linear Regression' => ta.linreg(trend, slope_period, 0) - ta.linreg(trend, slope_period, 1)
+    'Momentum'          => (trend - trend[slope_period]) / slope_period
+    =>                     ta.sma(trend - trend[1], slope_period)
+
+trend_slope = raw_slope * slope_scale
+
+// ── 3-State classification using deadband ─────────────────────────────────────
+slope_state      = trend_slope >  slope_deadband ? 1 : trend_slope < -slope_deadband ? -1 : 0
+entering_rising  = slope_state ==  1 and slope_state[1] != 1
+entering_flat    = slope_state ==  0 and slope_state[1] != 0
+entering_falling = slope_state == -1 and slope_state[1] != -1
+//╠════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╣
+//║ Colors :
+color_positive   = input.color(color.new(#26A69A, 0), 'Positive color (Bullish)',  group = 'Colors')
+color_negative   = input.color(color.new(#EF5350, 0), 'Negative color (Bearish)',  group = 'Colors')
+color_s_positive = input.color(color.new(#038197, 0), 'Slope positive color',      group = 'Colors')
+color_s_negative = input.color(color.new(#e74b7f, 0), 'Slope negative color',      group = 'Colors')
+color_neutral    = input.color(color.new(#808080, 0), 'Neutral color',             group = 'Colors')
+color_flat       = input.color(color.new(#B0BEC5, 0), 'Flat/Plateau color',        group = 'Colors')
+
+color_trend = trend > 0 ? color_positive : color_negative
+
+color_slope =
+     slope_state == 0 ? color_flat :
+     trend > 0
+         ? (slope_state ==  1 ? color.new(color_s_positive, 0) : color.new(color_s_negative, 0))
+         : (slope_state == -1 ? color.new(color_s_negative, 0) : color.new(color_s_positive, 0))
+//╠════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╣
+//║ Divergence / Exhaustion Detection :
+//
+// Phase lifecycle:
+//   INACTIVE  → waiting for a strong peak (≥ momentum_threshold) to open a cycle
+//   ACTIVE    → tracking; P1 is fixed at the last strong peak
+//   RESET     → trend crossed zero; back to INACTIVE until next strong peak
+//
+// P1 advancement rule (the key fix in v3.0):
+//   P1 only moves forward when a subsequent peak is ALSO strong (≥ threshold).
+//   A weak P2 (< threshold) fires a label if divergence conditions are met, but
+//   the P1 anchor stays fixed. This prevents orphaned cycles with no valid phase.
+//
+// Summary of all guard conditions for a label to fire:
+//   1. An active phase exists (P1 set by a strong peak, trend not yet crossed zero)
+//   2. P2 slope < P1 slope (momentum lower high / higher low)
+//   3. Price at P2 diverges from price at P1 (higher close for bull, lower for bear)
+//   4. trend[1] > 0 for bull exhaustion / trend[1] < 0 for bear exhaustion
+
+// ── Peak shape (no threshold) ─────────────────────────────────────────────────
+bull_any_peak  = trend_slope[1] >  trend_slope[0] and trend_slope[1] >= trend_slope[2] and trend_slope[1] >  0
+bear_any_peak  = trend_slope[1] <  trend_slope[0] and trend_slope[1] <= trend_slope[2] and trend_slope[1] <  0
+
+// ── Strong peaks (threshold-qualified) ───────────────────────────────────────
+bull_strong_peak = bull_any_peak and trend_slope[1] >  momentum_threshold
+bear_strong_peak = bear_any_peak and trend_slope[1] < -momentum_threshold
+
+// ── Persistent state — bull cycle ─────────────────────────────────────────────
+var float bull_p1_slope = na
+var float bull_p1_close = na
+var int   bull_p1_bar   = na
+var bool  bull_crossed  = false
+
+// ── Persistent state — bear cycle ─────────────────────────────────────────────
+var float bear_p1_slope = na
+var float bear_p1_close = na
+var int   bear_p1_bar   = na
+var bool  bear_crossed  = false
+
+// ── Trend zero-cross reset ─────────────────────────────────────────────────────
+if not na(bull_p1_slope) and trend <= 0
+    bull_crossed := true
+if not na(bear_p1_slope) and trend >= 0
+    bear_crossed := true
+
+// ── Bullish peak processing ───────────────────────────────────────────────────
+if bull_any_peak
+    if na(bull_p1_slope) or bull_crossed
+        // Phase establishment: strong peak required to open a new cycle
+        if bull_strong_peak
+            bull_p1_slope := trend_slope[1]
+            bull_p1_close := close[1]
+            bull_p1_bar   := bar_index[1]
+            bull_crossed  := false
+    else
+        // Active phase — check for divergence against the current P1
+        if trend_slope[1] < bull_p1_slope and close[1] > bull_p1_close and trend[1] > 0
+            if show_div_lines
+                line.new(bull_p1_bar, bull_p1_slope, bar_index[1], trend_slope[1],
+                     color = color.new(color_s_negative, 40),
+                     width = 1, style = line.style_dashed)
+        // P1 advances only if this peak is also strong — weak peaks leave P1 anchored
+        if bull_strong_peak
+            bull_p1_slope := trend_slope[1]
+            bull_p1_close := close[1]
+            bull_p1_bar   := bar_index[1]
+
+// ── Bearish trough processing ─────────────────────────────────────────────────
+if bear_any_peak
+    if na(bear_p1_slope) or bear_crossed
+        if bear_strong_peak
+            bear_p1_slope := trend_slope[1]
+            bear_p1_close := close[1]
+            bear_p1_bar   := bar_index[1]
+            bear_crossed  := false
+    else
+        if trend_slope[1] > bear_p1_slope and close[1] < bear_p1_close and trend[1] < 0
+            if show_div_lines
+                line.new(bear_p1_bar, bear_p1_slope, bar_index[1], trend_slope[1],
+                     color = color.new(color_s_positive, 40),
+                     width = 1, style = line.style_dashed)
+        if bear_strong_peak
+            bear_p1_slope := trend_slope[1]
+            bear_p1_close := close[1]
+            bear_p1_bar   := bar_index[1]
+//╠════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╣
+//║ Plot :
+plot_trend = plot(trend,       'Trend (Heikin Ashi)', show_line(color_trend),  1)
+plot_null  = plot(0,           'Null (Doji)',          color_neutral,           1, plot.style_cross)
+plot_slope = plot(trend_slope, 'Trend Slope',          show_slope(color_slope), 2)
+
+plot_db_upper = plot( slope_deadband, 'Deadband Upper', show_deadband(color.new(color_flat, 75)), 1, plot.style_line)
+plot_db_lower = plot(-slope_deadband, 'Deadband Lower', show_deadband(color.new(color_flat, 75)), 1, plot.style_line)
+fill(plot_db_upper, plot_db_lower, show_deadband(color.new(color_flat, 88)), 'Deadband Zone')
+//╠════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╣
+//║ State-transition markers :
+plotshape(show_markers(entering_rising  ? trend_slope : na),
+     'Slope → Rising',  shape.triangleup,   location.absolute, color.new(color_s_positive, 10), size = size.tiny)
+plotshape(show_markers(entering_falling ? trend_slope : na),
+     'Slope → Falling', shape.triangledown, location.absolute, color.new(color_s_negative, 10), size = size.tiny)
+plotshape(show_markers(entering_flat    ? trend_slope : na),
+     'Slope → Flat',    shape.circle,       location.absolute, color.new(color_flat, 10),        size = size.tiny, display=display.none)
+//╠════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╣
+//║ Hline :
+hline( 100, 'Maxval',      color_positive, hline.style_solid,   2)
+hline(  50, 'Pivot line',  color_neutral,  hline.style_solid)
+hline(  25, 'Pivot line',  color_neutral,  hline.style_dotted)
+hline(   0, 'Null (Doji)', color_neutral,  hline.style_solid)
+hline( -25, 'Pivot line',  color_neutral,  hline.style_dotted)
+hline( -50, 'Pivot line',  color_neutral,  hline.style_solid)
+hline(-100, 'Minval',      color_negative, hline.style_solid,   2)
+//╠════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╣
+//║ Fill :
+fill(plot_trend, plot_null, 0, trend < 0 ? -25 : 25, na, show_fill(color.new(color_trend, 50)), 'Color Fill')
+//╠════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╣
+//║ Bgcolor :
+bgcolor(math.abs(trend) > 25 ? show_highlight(color.new(color_trend, 87.5)) : na, title = 'Pivot Highlight (Weak)')
+bgcolor(math.abs(trend) > 50 ? show_highlight(color.new(color_trend, 87.5)) : na, title = 'Pivot Highlight (Strong)')
+//╚════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╝
